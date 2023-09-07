@@ -4,17 +4,37 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Change Logs:
- * Date         Author      Notes
- * 2009-01-05   Bernard     first version
- * 2011-02-14   onelife     Modify for EFM32
- * 2011-06-17   onelife     Merge all of the C source code into cpuport.c
- * 2012-12-23   aozima      stack addr align to 8byte.
- * 2012-12-29   Bernard     Add exception hook.
- * 2013-07-09   aozima      enhancement hard fault exception handler.
- * 2019-07-03   yangjie     add __rt_ffs() for armclang.
+ * Date           Author       Notes
+ * 2011-10-21     Bernard      the first version.
+ * 2011-10-27     aozima       update for cortex-M4 FPU.
+ * 2011-12-31     aozima       fixed stack align issues.
+ * 2012-01-01     aozima       support context switch load/store FPU register.
+ * 2012-12-11     lgnq         fixed the coding style.
+ * 2012-12-23     aozima       stack addr align to 8byte.
+ * 2012-12-29     Bernard      Add exception hook.
+ * 2013-06-23     aozima       support lazy stack optimized.
+ * 2018-07-24     aozima       enhancement hard fault exception handler.
+ * 2019-07-03     yangjie      add __rt_ffs() for armclang.
  */
 
 #include <rtthread.h>
+
+#if               /* ARMCC */ (  (defined ( __CC_ARM ) && defined ( __TARGET_FPU_VFP ))    \
+                  /* Clang */ || (defined ( __clang__ ) && defined ( __VFP_FP__ ) && !defined(__SOFTFP__)) \
+                  /* IAR */   || (defined ( __ICCARM__ ) && defined ( __ARMVFP__ ))        \
+                  /* GNU */   || (defined ( __GNUC__ ) && defined ( __VFP_FP__ ) && !defined(__SOFTFP__)) )
+#define USE_FPU   1
+#else
+#define USE_FPU   0
+#endif
+
+/* exception and interrupt handler table */
+rt_uint32_t rt_interrupt_from_thread;
+rt_uint32_t rt_interrupt_to_thread;
+rt_uint32_t rt_thread_switch_interrupt_flag;
+
+/* exception hook */
+static rt_err_t (*rt_exception_hook)(void *context) = RT_NULL;
 
 struct exception_stack_frame
 {
@@ -30,6 +50,11 @@ struct exception_stack_frame
 
 struct stack_frame
 {
+    rt_uint32_t tz;
+    rt_uint32_t lr;
+    rt_uint32_t psplim;
+    rt_uint32_t control;
+
     /* r4 ~ r11 register */
     rt_uint32_t r4;
     rt_uint32_t r5;
@@ -43,22 +68,77 @@ struct stack_frame
     struct exception_stack_frame exception_stack_frame;
 };
 
-/* flag in interrupt handling */
-rt_uint32_t rt_interrupt_from_thread, rt_interrupt_to_thread;
-rt_uint32_t rt_thread_switch_interrupt_flag;
-/* exception hook */
-static rt_err_t (*rt_exception_hook)(void *context) = RT_NULL;
+struct exception_stack_frame_fpu
+{
+    rt_uint32_t r0;
+    rt_uint32_t r1;
+    rt_uint32_t r2;
+    rt_uint32_t r3;
+    rt_uint32_t r12;
+    rt_uint32_t lr;
+    rt_uint32_t pc;
+    rt_uint32_t psr;
 
-/**
- * This function will initialize thread stack
- *
- * @param tentry the entry of thread
- * @param parameter the parameter of entry
- * @param stack_addr the beginning stack address
- * @param texit the function will be called when thread exit
- *
- * @return stack address
- */
+#if USE_FPU
+    /* FPU register */
+    rt_uint32_t S0;
+    rt_uint32_t S1;
+    rt_uint32_t S2;
+    rt_uint32_t S3;
+    rt_uint32_t S4;
+    rt_uint32_t S5;
+    rt_uint32_t S6;
+    rt_uint32_t S7;
+    rt_uint32_t S8;
+    rt_uint32_t S9;
+    rt_uint32_t S10;
+    rt_uint32_t S11;
+    rt_uint32_t S12;
+    rt_uint32_t S13;
+    rt_uint32_t S14;
+    rt_uint32_t S15;
+    rt_uint32_t FPSCR;
+    rt_uint32_t NO_NAME;
+#endif
+};
+
+struct stack_frame_fpu
+{
+    rt_uint32_t flag;
+
+    /* r4 ~ r11 register */
+    rt_uint32_t r4;
+    rt_uint32_t r5;
+    rt_uint32_t r6;
+    rt_uint32_t r7;
+    rt_uint32_t r8;
+    rt_uint32_t r9;
+    rt_uint32_t r10;
+    rt_uint32_t r11;
+
+#if USE_FPU
+    /* FPU register s16 ~ s31 */
+    rt_uint32_t s16;
+    rt_uint32_t s17;
+    rt_uint32_t s18;
+    rt_uint32_t s19;
+    rt_uint32_t s20;
+    rt_uint32_t s21;
+    rt_uint32_t s22;
+    rt_uint32_t s23;
+    rt_uint32_t s24;
+    rt_uint32_t s25;
+    rt_uint32_t s26;
+    rt_uint32_t s27;
+    rt_uint32_t s28;
+    rt_uint32_t s29;
+    rt_uint32_t s30;
+    rt_uint32_t s31;
+#endif
+
+    struct exception_stack_frame_fpu exception_stack_frame;
+};
+
 rt_uint8_t *rt_hw_stack_init(void       *tentry,
                              void       *parameter,
                              rt_uint8_t *stack_addr,
@@ -89,6 +169,66 @@ rt_uint8_t *rt_hw_stack_init(void       *tentry,
     stack_frame->exception_stack_frame.pc  = (unsigned long)tentry;    /* entry point, pc */
     stack_frame->exception_stack_frame.psr = 0x01000000L;              /* PSR */
 
+    stack_frame->tz = 0x00;                                            /* trustzone thread context */
+    /*
+     * Exception return behavior
+     * +--------+---+---+------+-------+------+-------+---+----+
+     * | PREFIX | - | S | DCRS | FType | Mode | SPSEL | - | ES |
+     * +--------+---+---+------+-------+------+-------+---+----+
+     * PREFIX [31:24]  - Indicates that this is an EXC_RETURN value. This field reads as 0b11111111.
+     * S      [6]      - Indicates whether registers have been pushed to a Secure or Non-secure stack.
+     *                    0: Non-secure stack used.
+     *                    1: Secure stack used.
+     * DCRS   [5]      - Indicates whether the default stacking rules apply, or whether the callee registers are already on the stack.
+     *                    0: Stacking of the callee saved registers is skipped.
+     *                    1: Default rules for stacking the callee registers are followed.
+     * FType  [4]      - In a PE with the Main and Floating-point Extensions:
+     *                    0: The PE allocated space on the stack for FP context.
+     *                    1: The PE did not allocate space on the stack for FP context.
+     *                    In a PE without the Floating-point Extension, this bit is Reserved, RES1.
+     * Mode   [3]      - Indicates the mode that was stacked from.
+     *                    0: Handler mode.
+     *                    1: Thread mode.
+     * SPSEL  [2]      - Indicates which stack contains the exception stack frame.
+     *                    0: Main stack pointer.
+     *                    1: Process stack pointer.
+     * ES     [0]      - Indicates the Security state the exception was taken to.
+     *                    0: Non-secure.
+     *                    1: Secure.
+     */
+#ifdef ARCH_ARM_CORTEX_SECURE
+    stack_frame->lr = 0xfffffffdL;
+#else
+    stack_frame->lr = 0xffffffbcL;
+#endif
+    stack_frame->psplim = 0x00;
+    /*
+     * CONTROL register bit assignments
+     * +---+------+------+-------+-------+
+     * | - | SFPA | FPCA | SPSEL | nPRIV |
+     * +---+------+------+-------+-------+
+     * SFPA   [3]      - Indicates that the floating-point registers contain active state that belongs to the Secure state:
+     *                    0: The floating-point registers do not contain state that belongs to the Secure state.
+     *                    1: The floating-point registers contain state that belongs to the Secure state.
+     *                    This bit is not banked between Security states and RAZ/WI from Non-secure state.
+     * FPCA   [2]      - Indicates whether floating-point context is active:
+     *                    0: No floating-point context active.
+     *                    1: Floating-point context active.
+     *                    This bit is used to determine whether to preserve floating-point state when processing an exception.
+     *                    This bit is not banked between Security states.
+     * SPSEL  [1]      - Defines the currently active stack pointer:
+     *                    0: MSP is the current stack pointer.
+     *                    1: PSP is the current stack pointer.
+     *                    In Handler mode, this bit reads as zero and ignores writes. The CortexM33 core updates this bit automatically onexception return.
+     *                    This bit is banked between Security states.
+     * nPRIV  [0]      - Defines the Thread mode privilege level:
+     *                    0: Privileged.
+     *                    1: Unprivileged.
+     *                    This bit is banked between Security states.
+     *
+     */
+    stack_frame->control = 0x00000000L;
+
     /* return task's current stack address */
     return stk;
 }
@@ -98,7 +238,7 @@ rt_uint8_t *rt_hw_stack_init(void       *tentry,
  *
  * @param exception_handle the exception handling hook function.
  */
-void rt_hw_exception_install(rt_err_t (*exception_handle)(void* context))
+void rt_hw_exception_install(rt_err_t (*exception_handle)(void *context))
 {
     rt_exception_hook = exception_handle;
 }
@@ -286,23 +426,20 @@ struct exception_info
     struct stack_frame stack_frame;
 };
 
-/*
- * fault exception handler
- */
-void rt_hw_hard_fault_exception(struct exception_info * exception_info)
+void rt_hw_hard_fault_exception(struct exception_info *exception_info)
 {
 #if defined(RT_USING_FINSH) && defined(MSH_USING_BUILT_IN_COMMANDS)
     extern long list_thread(void);
 #endif
-    struct stack_frame* context = &exception_info->stack_frame;
+    struct exception_stack_frame *exception_stack = &exception_info->stack_frame.exception_stack_frame;
+    struct stack_frame *context = &exception_info->stack_frame;
 
     if (rt_exception_hook != RT_NULL)
     {
         rt_err_t result;
 
-        result = rt_exception_hook(exception_info);
-        if (result == RT_EOK)
-            return;
+        result = rt_exception_hook(exception_stack);
+        if (result == RT_EOK) return;
     }
 
     rt_kprintf("psr: 0x%08x\n", context->exception_stack_frame.psr);
@@ -323,7 +460,7 @@ void rt_hw_hard_fault_exception(struct exception_info * exception_info)
     rt_kprintf(" lr: 0x%08x\n", context->exception_stack_frame.lr);
     rt_kprintf(" pc: 0x%08x\n", context->exception_stack_frame.pc);
 
-    if(exception_info->exc_return & (1 << 2) )
+    if (exception_info->exc_return & (1 << 2))
     {
         rt_kprintf("hard fault on thread: %s\r\n\r\n", rt_thread_self()->name);
 
@@ -334,6 +471,11 @@ void rt_hw_hard_fault_exception(struct exception_info * exception_info)
     else
     {
         rt_kprintf("hard fault on handler\r\n\r\n");
+    }
+
+    if ( (exception_info->exc_return & 0x10) == 0)
+    {
+        rt_kprintf("FPU active!\r\n");
     }
 
 #ifdef RT_USING_FINSH
@@ -388,15 +530,12 @@ exit
 #elif defined(__clang__)
 int __rt_ffs(int value)
 {
+    if (value == 0) return value;
+
     __asm volatile(
-        "CMP     %1, #0x00            \n"
-        "BEQ     1f                   \n"
-
-        "RBIT    %1, %1               \n"
-        "CLZ     %0, %1               \n"
-        "ADDS    %0, %0, #0x01        \n"
-
-        "1:                           \n"
+        "RBIT    r0, r0               \n"
+        "CLZ     r0, r0               \n"
+        "ADDS    r0, r0, #0x01        \n"
 
         : "=r"(value)
         : "r"(value)

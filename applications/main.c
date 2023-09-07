@@ -14,7 +14,7 @@ int main(void)
     while (1)
     {
 
-        LOG_D("Hello");
+//        LOG_D("Hello");
         rt_thread_mdelay(1000);
 
     }

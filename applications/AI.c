@@ -172,7 +172,7 @@ void AI_Reponse_Callback(void *parameter)
                     i,
                     y_valll[i]);
         }
-        cmd_free();
+        rt_thread_mdelay(1000);
     }
 }
 
